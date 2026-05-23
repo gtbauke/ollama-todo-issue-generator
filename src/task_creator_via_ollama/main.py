@@ -28,6 +28,28 @@ class TodoMessage:
         return f"{self.file}:{self.line}: ({self.type}): {self.message}"
 
 
+def get_file_context(file_path: str, target_line: int, window: int = 80) -> str:
+    try:
+        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+            lines = f.readlines()
+
+        start_index = max(0, target_line - window - 1)
+        end_index = min(len(lines), target_line + window)
+
+        context_lines: list[str] = []
+        for i in range(start_index, end_index):
+            line_num = i + 1
+
+            prefix = ">> " if line_num == target_line else "   "
+            context_lines.append(f"{prefix}{line_num:4d}: {lines[i].rstrip()}")
+
+        return "\n".join(context_lines)
+    except Exception as e:
+        click.echo(
+            f"Warning: Could not read file context for '{file_path}' (line {target_line}): {e}")
+        return f"(Could not retrieve file context: {e})"
+
+
 def generate_todo_hash(file_path: str, message: str) -> str:
     normalized_path = os.path.normpath(file_path).replace("\\", "/")
     unique_string = f"{normalized_path}:{message.strip()}"
@@ -132,19 +154,33 @@ def scan_for_todos(path: str) -> list[TodoMessage]:
 
 
 async def parse_todo_with_llm(client: httpx.AsyncClient, model_name: str, todo: TodoMessage) -> tuple[str, str]:
+    code_context = get_file_context(todo.file, todo.line)
+
     prompt = f"""
-    You are an AI assistant helping a developer convert raw source code TODO comments into clean, structured GitHub Issues.
-    
-    Analyze this TODO:
-    File Context: {todo.file} (Line {todo.line})
-    Raw Text: {todo.message}
-    
-    Return your response strictly in the following JSON format:
+    You are an expert Technical Product Manager and Lead Engineer. 
+    Your task is to convert a developer's code TODO comment into a rich, structured GitHub Issue.
+
+    Analyze the following TODO and its surrounding code context to understand WHY it was created.
+
+    File: {todo.file}
+    Target TODO: "{todo.message}"
+
+    Code Context:
+    ```
+    {code_context}
+    ```
+
+    Return your response strictly in the following JSON format. Do not output any Markdown wrapping the JSON, just the raw JSON object:
     {{
         "title": "A short, actionable issue title",
-        "body": "A descriptive overview of what needs fixing, referencing the file location."
+        "context": "Current context of why the issue was created based on the code",
+        "objective": "Objective of the issue",
+        "user_story": "As a [role], I want to [action] so that [benefit]",
+        "acceptance_criteria": [
+            "Specific measurable condition 1",
+            "Specific measurable condition 2"
+        ]
     }}
-    Do not output any introductory or concluding text, only the raw JSON.
     """
 
     async with OLLAMA_SEMAPHORE:
@@ -156,12 +192,12 @@ async def parse_todo_with_llm(client: httpx.AsyncClient, model_name: str, todo: 
                     "messages": [{"role": "user", "content": prompt}],
                     "format": "json",
                     "options": {
-                        "temperature": 0.2,
-                        "num_predict": 300
+                        "temperature": 0.35,
+                        "num_predict": 1000
                     },
                     "stream": False
                 },
-                timeout=60,
+                timeout=90,
             )
 
             response.raise_for_status()
@@ -172,7 +208,25 @@ async def parse_todo_with_llm(client: httpx.AsyncClient, model_name: str, todo: 
             else:
                 result = raw_result
 
-            return result.get('title', f"Fix TODO in {todo.file}"), result.get('body', todo.message)
+            title = result.get('title', f'Fix TODO in {todo.file}').strip()
+            ac_list = result.get('acceptance_criteria', [
+                                 "Resolve the TODO successfully."])
+            ac_markdown = "\n".join(f"- [ ] {ac.strip()}" for ac in ac_list)
+
+            body_markdown = f"""### Context
+            {result.get('context', 'No additional context provided.').strip()}
+
+            ### Objective
+            {result.get('objective', 'No specific objective provided.').strip()}
+
+            ### User Story
+            {result.get('user_story', 'No user story provided.').strip()}
+
+            ### Acceptance Criteria
+            {ac_markdown}
+            """
+
+            return title, body_markdown
         except Exception as e:
             click.echo(f"Error parsing TODO with LLM: {e}")
             return f"Fix TODO in {todo.file}", todo.message
