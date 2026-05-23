@@ -242,6 +242,8 @@ def fetch_existing_todo_hashes(repo: str, token: str) -> set[str]:
 # TODO: Add help command with usage examples and troubleshooting tips.
 # TODO: Add support for listing models and checking their status before processing.
 # TODO: Add whole TODO file parsing with context (e.g., surrounding lines of code) for better LLM understanding and issue generation.
+# TODO: Add command to list all TODOs found in the codebase without creating issues, for review purposes.
+# TODO: Add command to list open GitHub issues created by this tool, with links back to the source code locations.
 
 
 @click.command()
