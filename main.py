@@ -6,6 +6,7 @@ import subprocess
 import time
 import os
 import json
+import hashlib
 
 OLLAMA_URL = "http://localhost:11434"
 DEFAULT_MODEL = "llama3.2"
@@ -23,6 +24,12 @@ class TodoMessage:
 
     def __str__(self):
         return f"{self.file}:{self.line}: ({self.type}): {self.message}"
+
+
+def generate_todo_hash(file_path: str, message: str) -> str:
+    normalized_path = os.path.normpath(file_path).replace("\\", "/")
+    unique_string = f"{normalized_path}:{message.strip()}"
+    return hashlib.sha256(unique_string.encode('utf-8')).hexdigest()[:16]
 
 
 def ensure_ollama_running():
@@ -51,7 +58,7 @@ def ensure_ollama_running():
                 try:
                     requests.get(OLLAMA_URL)
                     click.echo("✓ Ollama is running.")
-                    break
+                    return
                 except requests.exceptions.ConnectionError:
                     continue
 
@@ -140,34 +147,46 @@ def parse_todo_with_llm(model_name: str, todo: TodoMessage) -> tuple[str, str]:
 
     try:
         response = requests.post(
-            f"{OLLAMA_URL}/api/generate",
+            f"{OLLAMA_URL}/api/chat",
             json={
                 "model": model_name,
                 "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 300,
-                "temperature": 0.2,
+                "format": "json",
+                "options": {
+                    "temperature": 0.2,
+                    "num_predict": 300
+                },
+                "stream": False
             },
         )
 
         response.raise_for_status()
-        result = json.loads(response.json().get('response', {}))
+        raw_result = response.json().get('message', {}).get('content', '')
 
-        return result.get('title', f"Fix TOTO in {todo.file}"), result.get('body', todo.message)
+        if isinstance(raw_result, str):
+            result = json.loads(raw_result)
+        else:
+            result = raw_result
+
+        return result.get('title', f"Fix TODO in {todo.file}"), result.get('body', todo.message)
     except Exception as e:
         click.echo(f"Error parsing TODO with LLM: {e}")
-        return f"Fix TOTO in {todo.file}", todo.message
+        return f"Fix TODO in {todo.file}", todo.message
 
 
-def create_github_issue(repo: str, token: str, title: str, body: str):
+def create_github_issue(repo: str, token: str, title: str, body: str, todo_hash: str = "") -> bool:
     url = f"https://api.github.com/repos/{repo}/issues"
     headers = {
         "Authorization": f"token {token}",
         "Accept": "application/vnd.github.v3+json",
     }
 
+    metadata_footer = f"\n\n<!-- todo-cli-id: {todo_hash} -->"
+    full_body = f"{body}\n\n---\n*Automated issue.*{metadata_footer}"
+
     payload = {
         "title": title,
-        "body": body,
+        "body": full_body,
     }
 
     response = requests.post(url, json=payload, headers=headers)
@@ -186,12 +205,52 @@ def unload_model(model_name: str):
         click.echo(f"Error unloading model: {e}")
 
 
+def fetch_existing_todo_hashes(repo: str, token: str) -> set[str]:
+    existing_hashes: set[str] = set()
+
+    url = f"https://api.github.com/repos/{repo}/issues"
+    headers = {
+        "Authorization": f"token {token}",
+        "Accept": "application/vnd.github.v3+json",
+    }
+
+    params: dict[str, str | int] = {
+        "state": "open",
+        "per_page": 100
+    }
+
+    try:
+        response = requests.get(url, headers=headers, params=params)
+        response.raise_for_status()
+        issues = response.json()
+
+        hash_regex = re.compile(r'<!-- todo-cli-id:\s*([a-f0-9]+)\s*-->')
+
+        for issue in issues:
+            body = issue.get('body') or ""
+            match = hash_regex.search(body)
+
+            if match:
+                existing_hashes.add(match.group(1))
+
+    except Exception as e:
+        click.echo(
+            f"Warning: Could not fetch existing issues from GitHub ({e}). Proceeding carefully.")
+
+    return existing_hashes
+
+# TODO: Add help command with usage examples and troubleshooting tips.
+# TODO: Add support for listing models and checking their status before processing.
+# TODO: Add whole TODO file parsing with context (e.g., surrounding lines of code) for better LLM understanding and issue generation.
+
+
 @click.command()
 @click.argument('target', default='.', type=click.Path(exists=True))
 @click.option('--model', default=DEFAULT_MODEL, help='Ollama model to use for translation.')
 @click.option('--repo', required=True, help='GitHub destination repo in format "owner/repo" (e.g., octocat/hello-world).')
 @click.option('--token', envvar='GITHUB_TOKEN', required=True, help='GitHub Personal Access Token (or set GITHUB_TOKEN environment variable).')
-def main(target: str, model: str, repo: str, token: str):
+@click.option('--dry-run', is_flag=True, help='Scan and parse TODOs without creating GitHub issues, just print results to console.')
+def main(target: str, model: str, repo: str, token: str, dry_run: bool):
     ensure_ollama_running()
     ensure_model_loaded(model)
 
@@ -203,17 +262,33 @@ def main(target: str, model: str, repo: str, token: str):
         return
 
     click.echo(
-        f"Found {len(todos)} items. Processing titles/descriptions via LLM...")
+        "Fetching existing open issues from GitHub to prevent duplicates...")
+    active_issue_hashes = fetch_existing_todo_hashes(repo, token)
+
+    click.echo(f"Found {len(todos)} local items. Filtering duplicates...")
 
     try:
         for index, todo in enumerate(todos, 1):
+            todo_hash = generate_todo_hash(todo.file, todo.message)
+
+            if todo_hash in active_issue_hashes:
+                click.echo(
+                    f"[{index}/{len(todos)}] Skipping (already has an open issue): {todo.file}:{todo.line}")
+                continue
+
             click.echo(
                 f"[{index}/{len(todos)}] Processing: {todo.file}:{todo.line}")
 
             title, body = parse_todo_with_llm(model, todo)
             full_body = f"{body}\n\n---\n*Automated issue created from source code tracking.*\n**File:** `{todo.file}`\n**Line:** {todo.line}"
 
-            success = create_github_issue(repo, token, title, full_body)
+            if dry_run:
+                click.echo(f"  -> [Dry Run] Title: '{title}'")
+                click.echo(f"  -> [Dry Run] Body:\n{full_body}\n")
+                continue
+
+            success = create_github_issue(
+                repo, token, title, full_body, todo_hash)
             if success:
                 click.echo(f"  -> Created Issue: '{title}'")
             else:
