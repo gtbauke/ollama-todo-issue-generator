@@ -1,4 +1,5 @@
 import re
+from typing import cast
 import click
 import sys
 import subprocess
@@ -153,7 +154,7 @@ def scan_for_todos(path: str) -> list[TodoMessage]:
     return todos
 
 
-async def parse_todo_with_llm(client: httpx.AsyncClient, model_name: str, todo: TodoMessage) -> tuple[str, str]:
+async def parse_todo_with_llm(client: httpx.AsyncClient, model_name: str, todo: TodoMessage) -> tuple[str, str, list[str]]:
     code_context = get_file_context(todo.file, todo.line)
 
     prompt = f"""
@@ -170,6 +171,9 @@ async def parse_todo_with_llm(client: httpx.AsyncClient, model_name: str, todo: 
     {code_context}
     ```
 
+    Choose 1 to 3 relevant labels from the strict list:
+    [bug, enhancement, feature, refactor, technical debt, security, performance, documentation, testing]
+
     Return your response strictly in the following JSON format. Do not output any Markdown wrapping the JSON, just the raw JSON object:
     {{
         "title": "A short, actionable issue title",
@@ -179,7 +183,8 @@ async def parse_todo_with_llm(client: httpx.AsyncClient, model_name: str, todo: 
         "acceptance_criteria": [
             "Specific measurable condition 1",
             "Specific measurable condition 2"
-        ]
+        ],
+        "labels": ["label1", "label2"]
     }}
     """
 
@@ -209,30 +214,37 @@ async def parse_todo_with_llm(client: httpx.AsyncClient, model_name: str, todo: 
                 result = raw_result
 
             title = result.get('title', f'Fix TODO in {todo.file}').strip()
+
+            labels = result.get('labels', [])
+            if not isinstance(labels, list):
+                labels = []
+
+            labels = cast(list[str], labels)
+
             ac_list = result.get('acceptance_criteria', [
                                  "Resolve the TODO successfully."])
             ac_markdown = "\n".join(f"- [ ] {ac.strip()}" for ac in ac_list)
 
             body_markdown = f"""### Context
-            {result.get('context', 'No additional context provided.').strip()}
+{result.get('context', 'No additional context provided.').strip()}
 
-            ### Objective
-            {result.get('objective', 'No specific objective provided.').strip()}
+### Objective
+{result.get('objective', 'No specific objective provided.').strip()}
 
-            ### User Story
-            {result.get('user_story', 'No user story provided.').strip()}
+### User Story
+{result.get('user_story', 'No user story provided.').strip()}
 
-            ### Acceptance Criteria
-            {ac_markdown}
+### Acceptance Criteria
+{ac_markdown}
             """
 
-            return title, body_markdown
+            return title, body_markdown, labels
         except Exception as e:
             click.echo(f"Error parsing TODO with LLM: {e}")
-            return f"Fix TODO in {todo.file}", todo.message
+            return f"Fix TODO in {todo.file}", todo.message, []
 
 
-async def create_github_issue(client: httpx.AsyncClient, repo: str, token: str, title: str, body: str, todo_hash: str = "") -> bool:
+async def create_github_issue(client: httpx.AsyncClient, repo: str, token: str, title: str, body: str, labels: list[str], todo_hash: str = "") -> bool:
     url = f"https://api.github.com/repos/{repo}/issues"
     headers = {
         "Authorization": f"token {token}",
@@ -242,9 +254,10 @@ async def create_github_issue(client: httpx.AsyncClient, repo: str, token: str, 
     metadata_footer = f"\n\n<!-- todo-cli-id: {todo_hash} -->"
     full_body = f"{body}\n\n---\n*Automated issue.*{metadata_footer}"
 
-    payload = {
+    payload: dict[str, str | list[str]] = {
         "title": title,
         "body": full_body,
+        "labels": labels
     }
 
     response = await client.post(url, json=payload, headers=headers)
@@ -302,7 +315,7 @@ async def process_single_todo(*, client: httpx.AsyncClient, model: str, repo: st
     todo_hash = generate_todo_hash(todo.file, todo.message)
 
     click.echo(f"[{index}/{total}] Processing: {todo.file}:{todo.line}")
-    title, body = await parse_todo_with_llm(client, model, todo)
+    title, body, labels = await parse_todo_with_llm(client, model, todo)
 
     full_body = (
         f"{body}\n\n---\n"
@@ -316,7 +329,7 @@ async def process_single_todo(*, client: httpx.AsyncClient, model: str, repo: st
         click.echo(f"  -> [Dry Run] Body:\n{full_body}\n")
         return
 
-    success = await create_github_issue(client, repo, token, title, full_body, todo_hash)
+    success = await create_github_issue(client, repo, token, title, full_body, labels, todo_hash)
     if success:
         click.echo(f"  -> Created Issue: '{title}'")
     else:
