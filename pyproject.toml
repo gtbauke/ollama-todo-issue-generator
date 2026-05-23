@@ -1,0 +1,10 @@
+[project]
+name = "task-creator-via-ollama"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "click>=8.4.1",
+    "requests>=2.34.2",
+]
